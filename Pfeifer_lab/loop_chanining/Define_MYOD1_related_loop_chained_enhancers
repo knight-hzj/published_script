@@ -285,7 +285,7 @@ if (nrow(modules)) {
 # -----------------------------
 outfile <- "MYOD1_related_modules_KO.tsv"
 fwrite(modules, outfile, sep = "\t")
-cat("✅ Done. Wrote:", nrow(modules), "rows to", outfile, "\n")
+cat("Done. Wrote:", nrow(modules), "rows to", outfile, "\n")
 
 if (nrow(modules)) {
   cat("TADs with modules:", length(unique(modules$tad_id)), "\n")
