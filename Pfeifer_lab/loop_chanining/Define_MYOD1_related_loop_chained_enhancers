@@ -1,0 +1,376 @@
+###Define MYOD1 related loop-chained enhancers
+
+# =========================================================
+# MYOD1-related enhancer module discovery 
+# Loop-overlap chaining within TADs, anchors extended ±5kb
+# =========================================================
+
+
+library(data.table)
+library(GenomicRanges)
+library(igraph)
+
+
+# -----------------------------
+# Parameters & Inputs
+# -----------------------------
+loops_file   <- "KO_loops.bedpe"
+peaks_file   <- "MYOD1_ChIP_K0.narrowPeak"
+enh_file     <- "Combined_enhancers_File.tsv"
+tads_bedpe   <- "KO_TAD_10000_blocks.bedpe"
+
+anchor_extend <- 5000L   # extend each loop anchor ±5 kb before overlaps
+
+# -----------------------------
+# Function
+# -----------------------------
+to_chr <- function(x) paste0("chr", gsub("^chr", "", as.character(x), ignore.case = TRUE))
+
+# Robust loop loader: skip comments, keep first 6 cols, normalize, numeric, drop invalid
+load_loops <- function(file){
+  message("Reading loops: ", file)
+  if (.Platform$OS.type != "windows") {
+    dt <- data.table::fread(
+      cmd = sprintf("grep -v '^#' %s", shQuote(file)),
+      sep = "\t", header = FALSE, quote = "", fill = TRUE, data.table = TRUE
+    )
+  } else {
+    txt <- readLines(file, warn = FALSE)
+    txt <- txt[!grepl("^\\s*#", txt)]
+    dt  <- data.table::fread(text = txt, sep = "\t", header = FALSE,
+                             quote = "", fill = TRUE, data.table = TRUE)
+  }
+  if (ncol(dt) < 6) stop("Loop file has fewer than 6 columns after removing comments: ", file)
+  dt <- dt[, 1:6]
+  data.table::setnames(dt, c("chr1","start1","end1","chr2","start2","end2"))
+  
+  dt[, `:=`(
+    chr1   = to_chr(chr1),
+    chr2   = to_chr(chr2),
+    start1 = suppressWarnings(as.numeric(start1)),
+    end1   = suppressWarnings(as.numeric(end1)),
+    start2 = suppressWarnings(as.numeric(start2)),
+    end2   = suppressWarnings(as.numeric(end2))
+  )]
+  
+  before <- nrow(dt)
+  dt <- dt[!is.na(start1) & !is.na(end1) & !is.na(start2) & !is.na(end2)]
+  
+  # fix reversed intervals if any
+  bad1 <- which(dt$end1 < dt$start1)
+  if (length(bad1)) {
+    tmp <- dt$start1[bad1]; dt$start1[bad1] <- dt$end1[bad1]; dt$end1[bad1] <- tmp
+  }
+  bad2 <- which(dt$end2 < dt$start2)
+  if (length(bad2)) {
+    tmp <- dt$start2[bad2]; dt$start2[bad2] <- dt$end2[bad2]; dt$end2[bad2] <- tmp
+  }
+  dt <- dt[(end1 >= start1) & (end2 >= start2)]
+  after <- nrow(dt)
+  
+  if (after < before) {
+    warning(sprintf("%d loop rows dropped due to non-numeric or invalid coordinates.", before - after))
+  }
+  dt[]
+}
+
+# -----------------------------
+# Load inputs
+# -----------------------------
+loops <- load_loops(loops_file)
+
+# Build anchor GRanges (±5kb)
+A_gr <- GRanges(
+  seqnames = loops$chr1,
+  ranges   = IRanges(pmax(1, loops$start1 + 1 - anchor_extend),
+                     loops$end1 + anchor_extend),
+  loop_id  = seq_len(nrow(loops)),
+  anchor   = "A"
+)
+B_gr <- GRanges(
+  seqnames = loops$chr2,
+  ranges   = IRanges(pmax(1, loops$start2 + 1 - anchor_extend),
+                     loops$end2 + anchor_extend),
+  loop_id  = seq_len(nrow(loops)),
+  anchor   = "B"
+)
+
+# -----------------------------
+# TADs (same-chrom)
+# -----------------------------
+tads_dt <- fread(tads_bedpe, fill = TRUE, data.table = TRUE)
+if (ncol(tads_dt) < 6) stop("TAD bedpe must have at least 6 columns.")
+setnames(tads_dt, 1:6, c("chrA","startA","endA","chrB","startB","endB"))
+tads_dt[, `:=`(chrA = to_chr(chrA), chrB = to_chr(chrB))]
+tads_dt <- tads_dt[chrA == chrB]
+tads_dt[, tad_id := .I]
+tads_gr <- GRanges(seqnames = tads_dt$chrA,
+                   ranges   = IRanges(as.numeric(tads_dt$startA), as.numeric(tads_dt$endA)),
+                   tad_id   = tads_dt$tad_id)
+
+# Assign loops to TADs
+hitsA <- findOverlaps(A_gr, tads_gr)
+hitsB <- findOverlaps(B_gr, tads_gr)
+A_by_loop <- split(subjectHits(hitsA), queryHits(hitsA))
+B_by_loop <- split(subjectHits(hitsB), queryHits(hitsB))
+tad_assign <- rep(NA_integer_, length(A_gr))
+for (i in seq_along(tad_assign)) {
+  tA <- A_by_loop[[as.character(i)]]
+  tB <- B_by_loop[[as.character(i)]]
+  if (!is.null(tA) && !is.null(tB)) {
+    inter <- intersect(tA, tB)
+    if (length(inter) > 0) tad_assign[i] <- tads_gr$tad_id[inter[1]]
+  }
+}
+loops[, tad_id := tad_assign]
+keep_idx <- which(!is.na(loops$tad_id))
+if (!length(keep_idx)) stop("No loops have both anchors within the same TAD.")
+loops_sub <- loops[keep_idx]
+A_sub <- A_gr[keep_idx]
+B_sub <- B_gr[keep_idx]
+
+# -----------------------------
+# MYOD1 peaks
+# -----------------------------
+peaks <- fread(peaks_file, data.table = TRUE)
+if (ncol(peaks) < 3) stop("narrowPeak must have at least 3 columns (chr, start, end).")
+peaks[[1]] <- to_chr(peaks[[1]])
+peaks_gr <- GRanges(seqnames = peaks[[1]],
+                    ranges   = IRanges(as.numeric(peaks[[2]]), as.numeric(peaks[[3]])))
+
+# -----------------------------
+# Enhancers
+# -----------------------------
+enh <- fread(enh_file, sep = "\t", header = TRUE, data.table = TRUE)
+setnames(enh, make.names(names(enh)))
+req <- c("CHROM","START","STOP","SIGNAL_K27ac","SIGNAL_K4me1")
+if (!all(req %in% names(enh))) stop("Enhancer file missing columns: ", paste(setdiff(req, names(enh)), collapse=", "))
+enh[, CHROM := to_chr(CHROM)]
+enh[, se_id := paste0(CHROM, ":", START, "-", STOP)]
+enh[, activity := rowMeans(.SD, na.rm = TRUE), .SDcols = c("SIGNAL_K27ac","SIGNAL_K4me1")]
+enh_gr <- GRanges(seqnames = enh$CHROM,
+                  ranges   = IRanges(as.numeric(enh$START), as.numeric(enh$STOP)),
+                  se_id = enh$se_id, activity = enh$activity)
+
+# -----------------------------
+# Direct enhancers = overlap MYOD1
+# -----------------------------
+ov_dir <- findOverlaps(enh_gr, peaks_gr)
+is_direct <- logical(length(enh_gr)); is_direct[queryHits(ov_dir)] <- TRUE
+
+# -----------------------------
+# Map anchors → enhancers
+# -----------------------------
+anchors_all <- c(A_sub, B_sub)
+anchor_id <- paste0(as.character(seqnames(anchors_all)), ":", start(anchors_all), "-", end(anchors_all))
+anchors_all$node_id <- anchor_id
+anchors_all$loop_row <- c(seq_len(nrow(loops_sub)), seq_len(nrow(loops_sub)))
+
+ov_anch_enh <- findOverlaps(anchors_all, enh_gr)
+anchor2enh <- data.table(
+  node_id = anchors_all$node_id[queryHits(ov_anch_enh)],
+  se_id   = enh_gr$se_id[subjectHits(ov_anch_enh)]
+)
+
+# -----------------------------
+# Build edges per TAD (nodes = anchors)
+# -----------------------------
+nodeA <- paste0(as.character(seqnames(A_sub)), ":", start(A_sub), "-", end(A_sub))
+nodeB <- paste0(as.character(seqnames(B_sub)), ":", start(B_sub), "-", end(B_sub))
+edges_dt <- data.table(A = nodeA, B = nodeB, tad_id = loops_sub$tad_id)
+
+# -----------------------------
+# Index enhancer info (deduplicated)
+# -----------------------------
+enh_info <- unique(data.table(
+  se_id = enh$se_id,
+  se_chr = enh$CHROM,
+  se_start = enh$START,
+  se_stop = enh$STOP,
+  se_activity = enh$activity,
+  direct = is_direct
+))
+setkey(enh_info, se_id)
+
+anch2enh_list <- split(anchor2enh$se_id, anchor2enh$node_id)
+
+# -----------------------------
+# Chaining within each TAD graph
+# -----------------------------
+out_list <- list()
+
+for (t in unique(edges_dt$tad_id)) {
+  e_sub <- edges_dt[tad_id == t, .(A, B)]
+  g <- graph_from_data_frame(e_sub, directed = FALSE)
+  if (ecount(g) == 0 || vcount(g) == 0) next
+  
+  nodes <- V(g)$name
+  se_on_nodes <- unique(unlist(anch2enh_list[intersect(nodes, names(anch2enh_list))], use.names = FALSE))
+  direct_se <- intersect(se_on_nodes, enh_info[direct == TRUE, se_id])
+  if (!length(direct_se)) next
+  
+  for (se in direct_se) {
+    direct_nodes <- names(anch2enh_list)[vapply(anch2enh_list, function(v) se %in% v, logical(1))]
+    direct_nodes <- intersect(direct_nodes, nodes)
+    if (!length(direct_nodes)) next
+    
+    d <- distances(g, v = direct_nodes, to = nodes)
+    min_d <- apply(d, 2, min, na.rm = TRUE)
+    min_d[!is.finite(min_d)] <- NA_real_
+    
+    reachable_nodes <- names(min_d)[!is.na(min_d) & min_d >= 1]
+    if (!length(reachable_nodes)) next
+    
+    rel_se <- unique(unlist(anch2enh_list[reachable_nodes], use.names = FALSE))
+    if (!length(rel_se)) next
+    
+    tad_row <- tads_gr[tads_gr$tad_id == t]
+    rel_gr  <- enh_gr[match(rel_se, enh_gr$se_id)]
+    rel_in  <- subsetByOverlaps(rel_gr, tad_row, ignore.strand = TRUE)
+    rel_se  <- rel_in$se_id
+    if (!length(rel_se)) next
+    
+    rel_hops <- vapply(rel_se, function(e2){
+      rn <- names(anch2enh_list)[vapply(anch2enh_list, function(v) e2 %in% v, logical(1))]
+      rn <- intersect(rn, names(min_d))
+      if (!length(rn)) return(NA_real_)
+      suppressWarnings(min(min_d[rn], na.rm = TRUE))
+    }, numeric(1))
+    
+    add <- data.table(
+      tad_id = t,
+      direct_enh_id  = se,
+      related_enh_id = rel_se,
+      min_hops       = rel_hops
+    )
+    out_list[[length(out_list)+1]] <- add
+  }
+}
+
+modules <- if (!length(out_list)) data.table() else rbindlist(out_list, use.names = TRUE, fill = TRUE)
+
+# -----------------------------
+# Join enhancer info safely (allow cartesian)
+# -----------------------------
+if (nrow(modules)) {
+  modules <- merge(modules, enh_info,
+                   by.x = "direct_enh_id", by.y = "se_id", all.x = TRUE,
+                   allow.cartesian = TRUE, suffixes = c("", "_direct"))[
+                     , .(tad_id,
+                         direct_enh_id,
+                         related_enh_id,
+                         min_hops,
+                         direct_coord = paste0(se_chr, ":", se_start, "-", se_stop),
+                         direct_activity = se_activity)
+                   ]
+  modules <- merge(modules, enh_info,
+                   by.x = "related_enh_id", by.y = "se_id", all.x = TRUE,
+                   allow.cartesian = TRUE, suffixes = c("", "_related"))[
+                     , .(tad_id,
+                         direct_enh_id,
+                         related_enh_id,
+                         min_hops,
+                         direct_coord,
+                         related_coord = paste0(se_chr, ":", se_start, "-", se_stop),
+                         direct_activity,
+                         related_activity = se_activity)
+                   ]
+  
+  modules <- unique(modules)
+  setorder(modules, tad_id, direct_enh_id, min_hops, related_enh_id)
+}
+
+# -----------------------------
+# Output main table
+# -----------------------------
+outfile <- "MYOD1_related_modules_KO.tsv"
+fwrite(modules, outfile, sep = "\t")
+cat("✅ Done. Wrote:", nrow(modules), "rows to", outfile, "\n")
+
+if (nrow(modules)) {
+  cat("TADs with modules:", length(unique(modules$tad_id)), "\n")
+  cat("Unique direct enhancers:", length(unique(modules$direct_enh_id)), "\n")
+  cat("Unique related enhancers:", length(unique(modules$related_enh_id)), "\n")
+}
+
+
+
+# ---- BEDs ----
+if (nrow(modules)) {
+  direct_bed <- unique(modules[, .(
+    chr = sub(":.*", "", direct_coord),
+    start = as.numeric(sub(".*:(\\d+)-.*", "\\1", direct_coord)),
+    end   = as.numeric(sub(".*-(\\d+)$", "\\1", direct_coord))
+  )])
+  related_bed <- unique(modules[, .(
+    chr = sub(":.*", "", related_coord),
+    start = as.numeric(sub(".*:(\\d+)-.*", "\\1", related_coord)),
+    end   = as.numeric(sub(".*-(\\d+)$", "\\1", related_coord))
+  )])
+  fwrite(direct_bed, "MYOD1_direct_enhancers_KO.bed", sep = "\t", col.names = FALSE)
+  fwrite(related_bed, "MYOD1_related_enhancers_KO.bed", sep = "\t", col.names = FALSE)
+  
+  # ---- Per-TAD summary ----
+  tad_summary <- modules[, .(
+    n_direct  = uniqueN(direct_enh_id),
+    n_related = uniqueN(related_enh_id)
+  ), by = tad_id]
+  fwrite(tad_summary, "MYOD1_modules_per_TAD_KO.tsv", sep = "\t")
+  
+
+
+
+
+###############################################################
+#  STEP 1:  Annotate MYOD1 modules with enhancer signal & type
+###############################################################
+library(data.table)
+library(GenomicRanges)
+library(dplyr)
+
+modules <- fread("MYOD1_related_modules_KO.tsv")
+super_file <- "LHCN_SMCHD1KO_Shared_superEnhancers_K27ac_K4me1_withGeneAnnotations20251018.csv"
+enh_file   <- "Combined_enhancersSMCHD1KO_12KB_STITCHED_TSS_DISTAL_REGION_MAP.tsv"
+
+# ---- Load enhancer signals (stitched regions) ----
+enh <- fread(enh_file)
+enh[, CHROM := ifelse(grepl("^chr", CHROM), CHROM, paste0("chr", CHROM))]
+enh[, se_id := paste0(CHROM, ":", START, "-", STOP)]
+setkey(enh, se_id)
+
+# ---- Load super-enhancers ----
+sup <- fread(super_file)
+sup[, seqnames := ifelse(grepl("^chr", seqnames), seqnames, paste0("chr", seqnames))]
+sup_gr <- GRanges(seqnames = sup$seqnames,
+                  ranges = IRanges(sup$start, sup$end),
+                  se_super_id = paste0(sup$seqnames, ":", sup$start, "-", sup$end))
+
+# ---- Build enhancer GRanges for overlap ----
+enh_gr <- GRanges(seqnames = enh$CHROM,
+                  ranges = IRanges(enh$START, enh$STOP),
+                  se_id = enh$se_id)
+
+# ---- Find which enhancers are super ----
+ov_sup <- findOverlaps(enh_gr, sup_gr)
+enh$type <- "stitched_enh"
+enh$type[queryHits(ov_sup)] <- "super_enh"
+
+# ---- Merge signal + type into modules ----
+modules_annot <- modules %>%
+  left_join(enh[, .(se_id, SIGNAL_K27ac, SIGNAL_K4me1, type)],
+            by = c("direct_enh_id" = "se_id")) %>%
+  rename(direct_K27ac = SIGNAL_K27ac,
+         direct_K4me1 = SIGNAL_K4me1,
+         direct_type  = type) %>%
+  left_join(enh[, .(se_id, SIGNAL_K27ac, SIGNAL_K4me1, type)],
+            by = c("related_enh_id" = "se_id")) %>%
+  rename(related_K27ac = SIGNAL_K27ac,
+         related_K4me1 = SIGNAL_K4me1,
+         related_type  = type)
+
+fwrite(modules_annot, "MYOD1_modules_withSuperType_KO.tsv", sep = "\t")
+
+
+
+
+
