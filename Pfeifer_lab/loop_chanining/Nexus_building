@@ -1,0 +1,194 @@
+## ──────────────────────────────────────────────────────────────────────────────
+## Enhancer↔Enhancer loop chaining analysis (per group) for WT and KO
+## ──────────────────────────────────────────────────────────────────────────────
+
+# Helper: ensure hop info is present in SE_* (direct = 0; related = min_hops)
+# We augment load_MYOD1modules() on-the-fly if hop not present.
+add_hops_to_SE <- function(se_gr, modules_tsv){
+  dt <- data.table::fread(modules_tsv, sep = "\t", header = TRUE)
+  setnames(dt, make.names(names(dt)))
+  # direct rows (hop 0)
+  d_dt <- dt[,.(se_coord = direct_coord, group_id = direct_coord, hop = 0L)]
+  # related rows (hop = min_hops)
+  r_dt <- dt[,.(se_coord = related_coord, group_id = direct_coord,
+                hop = suppressWarnings(as.integer(min_hops)))]
+  hop_dt <- unique(rbind(d_dt, r_dt, fill = TRUE))
+  # map back by se_id (== se_coord in your loader)
+  m <- match(S4Vectors::mcols(se_gr)$se_id, hop_dt$se_coord)
+  S4Vectors::mcols(se_gr)$hop <- hop_dt$hop[m]
+  S4Vectors::mcols(se_gr)$hop[is.na(S4Vectors::mcols(se_gr)$hop)] <- 0L  # fallback
+  se_gr
+}
+
+## 1) reload modules---from last step
+SE_WT <- load_MYOD1modules("MYOD1_modules_withSuperType_WT.tsv")
+SE_KO <- load_MYOD1modules("MYOD1_modules_withSuperType_KO.tsv")
+
+
+
+SE_WT_h <- add_hops_to_SE(SE_WT, "../MYOD1_modules_withSuperType_WT.tsv")
+SE_KO_h <- add_hops_to_SE(SE_KO, "../MYOD1_modules_withSuperType_KO.tsv")
+
+# Build enhancer↔enhancer edges from loops (within-group, undirected)
+build_EE_edges <- function(loops_dt, SE_gr, anchor_extend = 5000L){
+  # anchors (same recipe as in make_links)
+  s1 <- as.integer(loops_dt$start1); e1 <- as.integer(loops_dt$end1)
+  s2 <- as.integer(loops_dt$start2); e2 <- as.integer(loops_dt$end2)
+  a_start <- pmax(1L, s1 - as.integer(anchor_extend))
+  a_end   <- pmax(e1 + as.integer(anchor_extend), s1)
+  b_start <- pmax(1L, s2 - as.integer(anchor_extend))
+  b_end   <- pmax(e2 + as.integer(anchor_extend), s2)
+  
+  A_gr <- GenomicRanges::GRanges(seqnames = loops_dt$chr1,
+                                 ranges   = IRanges::IRanges(a_start, a_end),
+                                 loop_idx = loops_dt$loop_idx_src,
+                                 anchor   = "A")
+  B_gr <- GenomicRanges::GRanges(seqnames = loops_dt$chr2,
+                                 ranges   = IRanges::IRanges(b_start, b_end),
+                                 loop_idx = loops_dt$loop_idx_src,
+                                 anchor   = "B")
+  
+  ovA <- GenomicRanges::findOverlaps(A_gr, SE_gr, minoverlap = 1L)
+  ovB <- GenomicRanges::findOverlaps(B_gr, SE_gr, minoverlap = 1L)
+  
+  A_tbl <- data.frame(loop_idx = S4Vectors::mcols(A_gr)$loop_idx[S4Vectors::queryHits(ovA)],
+                      se_id    = S4Vectors::mcols(SE_gr)$se_id[S4Vectors::subjectHits(ovA)],
+                      group_id = S4Vectors::mcols(SE_gr)$group_id[S4Vectors::subjectHits(ovA)],
+                      hop      = S4Vectors::mcols(SE_gr)$hop[S4Vectors::subjectHits(ovA)],
+                      stringsAsFactors = FALSE)
+  
+  B_tbl <- data.frame(loop_idx = S4Vectors::mcols(B_gr)$loop_idx[S4Vectors::queryHits(ovB)],
+                      se_id    = S4Vectors::mcols(SE_gr)$se_id[S4Vectors::subjectHits(ovB)],
+                      group_id = S4Vectors::mcols(SE_gr)$group_id[S4Vectors::subjectHits(ovB)],
+                      hop      = S4Vectors::mcols(SE_gr)$hop[S4Vectors::subjectHits(ovB)],
+                      stringsAsFactors = FALSE)
+  
+  # join by loop and keep pairs within the same group; drop self-pairs
+  AB <- dplyr::inner_join(A_tbl, B_tbl, by = "loop_idx",
+                          suffix = c("_A","_B")) %>%
+    dplyr::filter(group_id_A == group_id_B, se_id_A != se_id_B)
+  
+  if (!nrow(AB)) return(dplyr::tibble())
+  
+  # undirected canonical pair key
+  AB$key_lo <- ifelse(AB$se_id_A < AB$se_id_B, AB$se_id_A, AB$se_id_B)
+  AB$key_hi <- ifelse(AB$se_id_A < AB$se_id_B, AB$se_id_B, AB$se_id_A)
+  
+  # one row per unique edge; keep group_id and hop info (min/mean)
+  edges <- AB %>%
+    dplyr::group_by(group_id = group_id_A, key_lo, key_hi) %>%
+    dplyr::summarise(
+      n_loops = dplyr::n(),
+      hop_lo  = min(hop_A, hop_B, na.rm = TRUE),
+      hop_hi  = max(hop_A, hop_B, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::rename(se1 = key_lo, se2 = key_hi)
+  
+  edges
+}
+
+edges_WT <- build_EE_edges(loops_WT, SE_WT_h, anchor_extend = anchor_extend)
+edges_KO <- build_EE_edges(loops_KO, SE_KO_h, anchor_extend = anchor_extend)
+
+# Per-group node table with hop
+nodes_from_SE <- function(SE_gr){
+  tibble::tibble(
+    se_id   = S4Vectors::mcols(SE_gr)$se_id,
+    group_id= S4Vectors::mcols(SE_gr)$group_id,
+    hop     = S4Vectors::mcols(SE_gr)$hop
+  ) %>%
+    dplyr::distinct()
+}
+
+nodes_WT <- nodes_from_SE(SE_WT_h)
+nodes_KO <- nodes_from_SE(SE_KO_h)
+
+# Summarise chaining within each group
+summarise_chains <- function(edges, nodes){
+  if (is.null(edges) || !nrow(edges)) {
+    return(tibble::tibble(
+      group_id = character(0), n_enh = integer(0), max_hop = integer(0),
+      first_last_direct = logical(0), n_adj_pairs = integer(0),
+      n_adj_present = integer(0), frac_adj_present = numeric(0),
+      n_extra_edges = integer(0), edge_density = numeric(0)
+    ))
+  }
+  
+  # precompute adjacency set for quick lookup
+  edge_key <- paste(edges$group_id, edges$se1, edges$se2, sep = "||")
+  edge_set <- unique(edge_key)
+  
+  # iterate groups
+  purrr::map_dfr(split(nodes, nodes$group_id), function(nd){
+    gid <- nd$group_id[1]
+    nd  <- nd %>% dplyr::arrange(hop, se_id)
+    enh <- nd$se_id
+    hops<- nd$hop
+    n   <- nrow(nd)
+    max_h <- if (n) max(hops, na.rm = TRUE) else NA_integer_
+    
+    # build all edges for this group
+    eg <- edges %>% dplyr::filter(group_id == gid)
+    
+    # first↔last direct?
+    first_last_direct <- FALSE
+    if (n >= 2) {
+      s1 <- enh[which.min(hops)]
+      sN <- enh[which.max(hops)]
+      k  <- paste(gid, min(s1,sN), max(s1,sN), sep = "||")
+      first_last_direct <- k %in% edge_set
+    }
+    
+    # adjacent hop pairs present?
+    n_adj_pairs <- 0L
+    n_adj_present <- 0L
+    if (n >= 2) {
+      # for each hop level k, pairs between hop==k and hop==k+1
+      H <- sort(unique(hops))
+      for (k in H) {
+        if ((k+1) %in% H) {
+          A <- enh[hops == k]
+          B <- enh[hops == (k+1)]
+          if (length(A) && length(B)) {
+            # all cross-pairs between A and B
+            cr <- expand.grid(A=A, B=B, stringsAsFactors=FALSE)
+            n_adj_pairs <- n_adj_pairs + nrow(cr)
+            # count how many are edges
+            present <- sum(apply(cr, 1, function(r){
+              key <- paste(gid, min(r["A"], r["B"]), max(r["A"], r["B"]), sep="||")
+              key %in% edge_set
+            }))
+            n_adj_present <- n_adj_present + present
+          }
+        }
+      }
+    }
+    
+    # extra (non-adjacent) edges
+    n_extra_edges <- 0L
+    if (nrow(eg)) {
+      # edge is extra if |hop_hi - hop_lo| >= 2
+      n_extra_edges <- sum((eg$hop_hi - eg$hop_lo) >= 2, na.rm = TRUE)
+    }
+    
+    # edge density among all possible pairs within group
+    all_pairs <- if (n >= 2) n*(n-1)/2 else 0
+    density <- if (all_pairs > 0) nrow(eg)/all_pairs else NA_real_
+    
+    tibble::tibble(
+      group_id = gid,
+      n_enh    = n,
+      max_hop  = max_h,
+      first_last_direct = first_last_direct,
+      n_adj_pairs = n_adj_pairs,
+      n_adj_present = n_adj_present,
+      frac_adj_present = ifelse(n_adj_pairs>0, n_adj_present/n_adj_pairs, NA_real_),
+      n_extra_edges = n_extra_edges,
+      edge_density  = density
+    )
+  })
+}
+
+chain_WT <- summarise_chains(edges_WT, nodes_WT)
+chain_KO <- summarise_chains(edges_KO, nodes_KO)
