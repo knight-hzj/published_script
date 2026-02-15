@@ -1,1 +1,432 @@
-qqq
+###Group information added
+library(dplyr)        
+library(data.table)
+library(GenomicRanges)
+library(AnnotationDbi)
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+library(org.Hs.eg.db)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(tibble)
+
+
+#####─────────────────────────────────────────────────────────────────────────────
+## Parameters
+####──────────────────────────────────────────────────────────────────────────────
+promoter_upstream   <- 2000L
+promoter_downstream <- 2000L
+gene_window_bp      <- 2e6
+alpha_dist          <- 0.7
+min_distance_bp     <- 5000L
+anchor_extend       <- 5000L   # ±5 kb
+
+#####────────────────────────────────────────────────────────────────────────
+## Helpers
+#####──────────────────────────────────────────────────────────────────────────────
+to_chr  <- function(x) paste0("chr", gsub("^chr", "", as.character(x), ignore.case = TRUE))
+safe_div <- function(a, b) ifelse(!is.na(a) & !is.na(b) & b != 0, a / b, NA_real_)
+
+####### ──────────────────────────────────────────────────────────────────────────────
+## Build promoters & TSS (hg19)
+#######──────────────────────────────────────────────────────────────────────────────
+build_promoters <- function(up = 2000L, down = 2000L) {
+  txdb <- TxDb.Hsapiens.UCSC.hg19.knownGene
+  genes_txdb <- genes(txdb)
+  tss_pts <- resize(genes_txdb, width = 1, fix = "start")
+  prom <- promoters(tss_pts, upstream = up, downstream = down)
+  map <- AnnotationDbi::select(org.Hs.eg.db,
+                               keys    = as.character(prom$gene_id),
+                               keytype = "ENTREZID",
+                               columns = c("SYMBOL"))
+  m <- match(as.character(prom$gene_id), map$ENTREZID)
+  prom$SYMBOL <- map$SYMBOL[m]
+  list(promoters = prom, tss = resize(prom, width = 1, fix = "center"))
+}
+
+## ──────────────────────────────────────────────────────────────────────────────
+## Load MYOD1 modules (direct + related enhancers) WITH group_id = direct_coord
+## ──────────────────────────────────────────────────────────────────────────────
+load_MYOD1modules <- function(file) {
+  message("Reading module file: ", file)
+  dt <- fread(file, sep = "\t", header = TRUE)
+  setnames(dt, make.names(names(dt)))  # standardize names
+  
+  # Expect columns (tab-separated): tad_id, direct_enh_id, related_enh_id, min_hops,
+  # direct_coord, related_coord, direct_activity, related_activity, direct_K27ac,
+  # direct_K4me1, direct_type, related_K27ac, related_K4me1, related_type
+  
+  # Direct rows
+  direct_dt <- dt[, .(
+    seqnames = sub(":.*", "", direct_coord),
+    start    = as.numeric(sub(".*:(\\d+)-.*", "\\1", direct_coord)),
+    end      = as.numeric(sub(".*-(\\d+)$",  "\\1", direct_coord)),
+    SIGNAL_K27ac = as.numeric(direct_K27ac),
+    SIGNAL_K4me1 = as.numeric(direct_K4me1),
+    type         = direct_type,
+    group_id     = direct_coord,           # group_id = direct_coord
+    se_coord     = direct_coord            # this enhancer's coord (for se_id)
+  )]
+  
+  # Related rows -> group_id is still the paired direct_coord (one per row)
+  related_dt <- dt[, .(
+    seqnames = sub(":.*", "", related_coord),
+    start    = as.numeric(sub(".*:(\\d+)-.*", "\\1", related_coord)),
+    end      = as.numeric(sub(".*-(\\d+)$",  "\\1", related_coord)),
+    SIGNAL_K27ac = as.numeric(related_K27ac),
+    SIGNAL_K4me1 = as.numeric(related_K4me1),
+    type         = related_type,
+    group_id     = direct_coord,           # inherit the direct_coord as group
+    se_coord     = related_coord
+  )]
+  
+  enh_dt <- rbind(direct_dt, related_dt, fill = TRUE)
+  enh_dt <- unique(enh_dt[!is.na(start) & !is.na(end)])
+  
+  enh_dt$Activity   <- rowMeans(enh_dt[, .(SIGNAL_K27ac, SIGNAL_K4me1)], na.rm = TRUE)
+  enh_dt$seqnames   <- to_chr(enh_dt$seqnames)
+  enh_dt$se_id      <- enh_dt$se_coord      # use exact coord as se_id
+  enh_dt$se_type    <- enh_dt$type          # stitched_enh / super_enh
+  enh_dt$group_id   <- enh_dt$group_id      # direct_coord
+  
+  # Build GRanges with se_id, se_activity, se_type, group_id
+  GRanges(
+    seqnames    = enh_dt$seqnames,
+    ranges      = IRanges(as.integer(enh_dt$start), as.integer(enh_dt$end)),
+    se_id       = enh_dt$se_id,
+    se_activity = enh_dt$Activity,
+    se_type     = enh_dt$se_type,
+    group_id    = enh_dt$group_id
+  )
+}
+
+## ──────────────────────────────────────────────────────────────────────────────
+## Load HiCCUPS BEDPE
+## ──────────────────────────────────────────────────────────────────────────────
+load_loops <- function(file) {
+  message("Reading ", file)
+  
+  x <- data.table::fread(file,
+                         header = FALSE,
+                         fill = TRUE,
+                         quote = FALSE,
+                         data.table = TRUE)
+  
+  # strip literal quotes
+  for (cc in names(x)) x[[cc]] <- gsub('^"|"$', '', x[[cc]])
+  
+  # keep only rows where core numeric fields exist
+  is_int <- function(z) grepl("^[0-9]+$", z)
+  data_rows <- is_int(x$V2) & is_int(x$V3) & is_int(x$V5) & is_int(x$V6)
+  x <- x[data_rows]
+  
+  # rename
+  setnames(x, old = paste0("V", 1:24),
+           new = c("chr1","start1","end1","chr2","start2","end2",
+                   "name","score","strand1","strand2","color",
+                   "observed","expectedBL","expectedDonut","expectedH","expectedV",
+                   "fdrBL","fdrDonut","fdrH","fdrV","numCollapsed","centroid1","centroid2","radius"),
+           skip_absent = TRUE)
+  
+  # normalize chr and scrub
+  x[, chr1 := to_chr(chr1)]
+  x[, chr2 := to_chr(chr2)]
+  chr_ok <- function(v) { v <- as.character(v); v[nchar(v)==0] <- NA_character_; v }
+  x[, chr1 := chr_ok(chr1)]
+  x[, chr2 := chr_ok(chr2)]
+  pat <- "^chr([1-9]|1[0-9]|2[0-2]|X|Y|M)$"
+  keep_chr <- grepl(pat, x$chr1) & grepl(pat, x$chr2)
+  x <- x[keep_chr]
+  
+  # coerce numeric
+  num_cols <- intersect(c("start1","end1","start2","end2","score","observed","expectedBL",
+                          "expectedDonut","expectedH","expectedV","centroid1","centroid2",
+                          "radius","numCollapsed"),
+                        names(x))
+  for (c in num_cols) x[[c]] <- suppressWarnings(as.numeric(trimws(x[[c]])))
+  
+  # final drop NA coords
+  x <- x[!is.na(start1) & !is.na(end1) & !is.na(start2) & !is.na(end2)]
+  
+  # stable index
+  x[, loop_idx_src := .I]
+  x[]
+}
+
+## ──────────────────────────────────────────────────────────────────────────────
+## Core linking (STRICT CROSS-ANCHOR ONLY)
+## ──────────────────────────────────────────────────────────────────────────────
+make_links <- function(loops_dt, SE_gr, promoters_gr, tss_gr,
+                       alpha = 0.7, min_d = 5000L, window_bp = 2e6, cond = "WT") {
+  
+  cat(">>> DEBUG: first 5 coords\n")
+  print(head(loops_dt[, c("chr1","start1","end1","chr2","start2","end2")], 5))
+  
+  # remove any loops with NA core coords (defensive)
+  bad <- which(is.na(loops_dt$start1) | is.na(loops_dt$end1) |
+                 is.na(loops_dt$start2) | is.na(loops_dt$end2))
+  if (length(bad)) loops_dt <- loops_dt[-bad, , drop = FALSE]
+  if (!nrow(loops_dt)) return(data.frame())
+  
+  # anchors
+  s1 <- as.integer(loops_dt$start1); e1 <- as.integer(loops_dt$end1)
+  s2 <- as.integer(loops_dt$start2); e2 <- as.integer(loops_dt$end2)
+  
+  a_start <- pmax(1L, s1 - as.integer(anchor_extend))
+  a_end   <- pmax(e1 + as.integer(anchor_extend), s1)
+  b_start <- pmax(1L, s2 - as.integer(anchor_extend))
+  b_end   <- pmax(e2 + as.integer(anchor_extend), s2)
+  
+  # build GRanges
+  A_gr <- GRanges(seqnames = loops_dt$chr1,
+                  ranges   = IRanges(a_start, a_end),
+                  loop_idx = loops_dt$loop_idx_src,
+                  anchor   = "A")
+  B_gr <- GRanges(seqnames = loops_dt$chr2,
+                  ranges   = IRanges(b_start, b_end),
+                  loop_idx = loops_dt$loop_idx_src,
+                  anchor   = "B")
+  
+  # overlaps
+  ov_A_prom <- findOverlaps(A_gr, promoters_gr, minoverlap = 1L)
+  ov_B_prom <- findOverlaps(B_gr, promoters_gr, minoverlap = 1L)
+  ov_A_se   <- findOverlaps(A_gr, SE_gr,       minoverlap = 1L)
+  ov_B_se   <- findOverlaps(B_gr, SE_gr,       minoverlap = 1L)
+  
+  # tables; drop NA promoter symbols
+  A_prom <- data.frame(loop_idx   = mcols(A_gr)$loop_idx[queryHits(ov_A_prom)],
+                       gene_symbol= promoters_gr$SYMBOL[subjectHits(ov_A_prom)],
+                       stringsAsFactors = FALSE) %>% filter(!is.na(gene_symbol))
+  B_prom <- data.frame(loop_idx   = mcols(B_gr)$loop_idx[queryHits(ov_B_prom)],
+                       gene_symbol= promoters_gr$SYMBOL[subjectHits(ov_B_prom)],
+                       stringsAsFactors = FALSE) %>% filter(!is.na(gene_symbol))
+  
+  A_se   <- data.frame(loop_idx   = mcols(A_gr)$loop_idx[queryHits(ov_A_se)],
+                       se_id      = SE_gr$se_id[subjectHits(ov_A_se)],
+                       se_activity= SE_gr$se_activity[subjectHits(ov_A_se)],
+                       enhancer_class = SE_gr$se_type[subjectHits(ov_A_se)],
+                       group_id       = SE_gr$group_id[subjectHits(ov_A_se)],
+                       stringsAsFactors = FALSE)
+  B_se   <- data.frame(loop_idx   = mcols(B_gr)$loop_idx[queryHits(ov_B_se)],
+                       se_id      = SE_gr$se_id[subjectHits(ov_B_se)],
+                       se_activity= SE_gr$se_activity[subjectHits(ov_B_se)],
+                       enhancer_class = SE_gr$se_type[subjectHits(ov_B_se)],
+                       group_id       = SE_gr$group_id[subjectHits(ov_B_se)],
+                       stringsAsFactors = FALSE)
+  
+  # STRICT CROSS-ANCHOR ONLY
+  pairs <- bind_rows(
+    inner_join(A_prom, B_se, by="loop_idx", relationship="many-to-many") %>%
+      mutate(orientation="A=prom,B=SE"),
+    inner_join(B_prom, A_se, by="loop_idx", relationship="many-to-many") %>%
+      mutate(orientation="B=prom,A=SE")
+  ) %>%
+    distinct(loop_idx, gene_symbol, se_id, .keep_all = TRUE)
+  
+  if (!nrow(pairs)) return(pairs)
+  
+  # loop meta & contact
+  meta <- loops_dt %>%
+    select(loop_idx = loop_idx_src, chr1, start1, end1, chr2, start2, end2,
+           observed, expectedBL, score)
+  df <- left_join(pairs, meta, by = "loop_idx")
+  
+  df$contact_oe     <- safe_div(df$observed, df$expectedBL)
+  df$contact_weight <- df$contact_oe
+  
+  # distances enhancer ↔ TSS
+  df$distance_bp <- NA_real_
+  tss_dt <- data.frame(seqnames = as.character(GenomicRanges::seqnames(tss_gr)),
+                       start    = GenomicRanges::start(tss_gr),
+                       SYMBOL   = tss_gr$SYMBOL)
+  SE_idx <- split(seq_along(SE_gr), SE_gr$se_id)
+  
+  for (i in seq_len(nrow(df))) {
+    sid <- df$se_id[i]; sym <- df$gene_symbol[i]
+    if (is.na(sid) || is.na(sym)) next
+    se_hits <- SE_idx[[sid]]
+    if (is.null(se_hits) || length(se_hits) == 0) next
+    se <- SE_gr[se_hits[1]]
+    
+    row <- tss_dt[tss_dt$SYMBOL == sym, , drop=FALSE]
+    if (nrow(row) == 0 || is.na(row$start) || is.na(row$seqnames)) next
+    
+    tss_gr <- GRanges(row$seqnames, IRanges(row$start, row$start))
+    df$distance_bp[i] <- suppressWarnings(min(distance(se, tss_gr)))
+  }
+  
+  df$distance_for_calc <- pmax(df$distance_bp, min_d, na.rm = TRUE)
+  df$contact_dw        <- df$contact_weight / (df$distance_for_calc ^ alpha)
+  df$ABC_raw           <- df$se_activity * pmax(df$contact_dw, 0)
+  
+  # normalize per gene within window
+  tss_unique <- tss_dt %>%
+    group_by(SYMBOL) %>% slice_head(n=1) %>% ungroup() %>%
+    mutate(tss_chr = seqnames, tss_mid = start)
+  
+  SE_mid <- data.frame(se_id = SE_gr$se_id,
+                       se_chr = as.character(GenomicRanges::seqnames(SE_gr)),
+                       se_mid = as.integer((GenomicRanges::start(SE_gr) + GenomicRanges::end(SE_gr))/2))
+  df <- left_join(df, tss_unique, by = c("gene_symbol" = "SYMBOL"))
+  df <- left_join(df, SE_mid,     by = "se_id")
+  
+  df$within_window <- with(df, !is.na(tss_mid) & !is.na(se_mid) &
+                             (tss_chr == se_chr) &
+                             (abs(se_mid - tss_mid) <= window_bp))
+  
+  df$ABC_norm <- NA_real_
+  split_idx <- split(seq_len(nrow(df)), df$gene_symbol)
+  for (g in names(split_idx)) {
+    idx  <- split_idx[[g]]
+    idxw <- idx[df$within_window[idx]]
+    if (length(idxw) > 0) {
+      denom <- sum(df$ABC_raw[idxw], na.rm = TRUE)
+      if (denom > 0) df$ABC_norm[idxw] <- df$ABC_raw[idxw] / denom
+    }
+  }
+  
+  df$condition <- cond
+  df
+}
+
+## ──────────────────────────────────────────────────────────────────────────────
+## Load inputs
+## ──────────────────────────────────────────────────────────────────────────────
+loops_WT <- load_loops("WT_loops.bedpe")
+loops_KO <- load_loops("KO_loops.bedpe")
+loops_WT <- as_tibble(loops_WT)
+loops_KO <- as_tibble(loops_KO)
+
+SE_WT <- load_MYOD1modules("MYOD1_modules_withSuperType_WT.tsv") 
+SE_KO <- load_MYOD1modules("MYOD1_modules_withSuperType_KO.tsv")
+
+prom_info <- build_promoters(promoter_upstream, promoter_downstream)
+promoters <- prom_info$promoters
+tss       <- prom_info$tss
+
+# Drop promoters with NA symbol (kills links)
+na_prom <- which(is.na(promoters$SYMBOL))
+if (length(na_prom) > 0) {
+  message("Dropping ", length(na_prom), " promoters with NA gene symbol")
+  promoters <- promoters[-na_prom]
+  tss       <- tss[-na_prom]
+}
+
+## ──────────────────────────────────────────────────────────────────────────────
+## Run linking (STRICT cross-anchor)
+## ──────────────────────────────────────────────────────────────────────────────
+links_WT <- make_links(loops_WT, SE_WT, promoters, tss,
+                       alpha_dist, min_distance_bp, gene_window_bp, "WT")
+links_KO <- make_links(loops_KO, SE_KO, promoters, tss,
+                       alpha_dist, min_distance_bp, gene_window_bp, "KO")
+
+# append group_id as last column (already present in links via pairs -> kept in df)
+# ensure column order ends with group_id
+reorder_with_group <- function(df) {
+  if (!nrow(df)) return(df)
+  cols <- colnames(df)
+  cols <- c(setdiff(cols, "group_id"), "group_id")
+  df[, cols]
+}
+links_WT <- reorder_with_group(links_WT)
+links_KO <- reorder_with_group(links_KO)
+
+fwrite(links_WT, "WT_MYOD1modules_promoter_links_with_ABC_plus_groupinfo.tsv", sep = "\t")
+fwrite(links_KO, "KO_MYOD1modules_promoter_links_with_ABC_plus_groupinfo.tsv", sep = "\t")
+
+## ──────────────────────────────────────────────────────────────────────────────
+## ΔABC + enhancer_type + RNA-seq
+## ──────────────────────────────────────────────────────────────────────────────
+# enhancer_type map from WT/KO sets
+WT_ids <- unique(SE_WT$se_id)
+KO_ids <- unique(SE_KO$se_id)
+type_map <- tibble(
+  se_id = union(WT_ids, KO_ids),
+  enhancer_type = case_when(
+    se_id %in% WT_ids & se_id %in% KO_ids ~ "both",
+    se_id %in% WT_ids & !(se_id %in% KO_ids) ~ "WT_only",
+    se_id %in% KO_ids & !(se_id %in% WT_ids) ~ "KO_only",
+    TRUE ~ NA_character_
+  )
+)
+
+# Merge and compute ΔABC
+comb_cols <- c("se_id", "gene_symbol")
+diff_df <- full_join(
+  select(links_WT, all_of(c(comb_cols,"ABC_norm","ABC_raw","contact_weight","enhancer_class","group_id"))) %>%
+    rename(ABC_norm_WT=ABC_norm, ABC_raw_WT=ABC_raw, contact_WT=contact_weight,
+           enhancer_class_WT = enhancer_class),
+  select(links_KO, all_of(c(comb_cols,"ABC_norm","ABC_raw","contact_weight","enhancer_class","group_id"))) %>%
+    rename(ABC_norm_KO=ABC_norm, ABC_raw_KO=ABC_raw, contact_KO=contact_weight,
+           enhancer_class_KO = enhancer_class),
+  by=comb_cols
+) %>%
+  mutate(
+    across(c(ABC_norm_WT,ABC_norm_KO,ABC_raw_WT,ABC_raw_KO,contact_WT,contact_KO), ~coalesce(as.numeric(.),0)),
+    Delta_ABC = ABC_norm_KO - ABC_norm_WT,
+    Delta_raw = ABC_raw_KO  - ABC_raw_WT,
+    # prefer a non-NA enhancer_class from KO else WT
+    enhancer_class = coalesce(enhancer_class_KO, enhancer_class_WT),
+    .after = contact_KO
+  ) %>%
+  select(-enhancer_class_WT, -enhancer_class_KO)
+
+
+
+# RNA-seq loader (update--different from the previous one above)
+load_rna <- function(file) {
+  if (!file.exists(file)) return(NULL)
+  
+  rna <- fread(file)
+  
+  ## assume first 7 or 8 columns are limma results
+  block1 <- rna[,1:8, with=FALSE]  # takes columns 1..8
+  
+  # rename only what's present
+  old_names <- c("ENSEMBL","SYMBOL","logFC","AveExpr","t","P.Value","adj.P.Val","B")
+  new_names <- c("ENSEMBL","SYMBOL","log2FC","AveExpr","t","P.Value","FDR","B")
+  setnames(block1, old=old_names, new=new_names, skip_absent=TRUE)
+  
+  # now select the 3 we need and return
+  keep <- block1[,.(SYMBOL,log2FC,FDR)]
+  return(keep)
+}
+
+## add enhancer_class + enhancer_type + group_id
+diff_df <- left_join(diff_df, type_map,  by="se_id")
+diff_df <- left_join(diff_df, group_map, by="se_id")  
+
+## add RNA
+rna <- load_rna("WT_SMCKO_totalRsq.csv") 
+head(rna)
+diff_df <- diff_df %>% left_join(rna, by=c("gene_symbol"="SYMBOL"))
+
+
+## unify group_id columns (take x then y as fallback)
+if ("group_id.x" %in% names(diff_df)) {
+  diff_df$group_id <- diff_df$group_id.x
+}
+if ("group_id.y" %in% names(diff_df)) {
+  diff_df$group_id[is.na(diff_df$group_id)] <- diff_df$group_id.y[is.na(diff_df$group_id)]
+}
+
+## drop old versions
+diff_df <- diff_df %>% select(-group_id.x, -group_id.y)
+
+## put group_id LAST
+
+cols <- colnames(diff_df)
+cols <- c(setdiff(cols, "group_id"), "group_id")
+diff_df <- diff_df[, cols]
+
+## ──────────────────────────────────────────────────────────────────────────────
+## Sanity check: CCL2 present in KO links?
+## ──────────────────────────────────────────────────────────────────────────────
+has_CCL2_KO <- any(links_KO$gene_symbol == "CCL2")
+if (!has_CCL2_KO) {
+  warning("CCL2 not found in KO links.")
+} else {
+  message("✅ CCL2 present in KO links.")
+}
+
+
