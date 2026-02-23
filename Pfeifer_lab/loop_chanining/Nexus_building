@@ -13,7 +13,7 @@ add_hops_to_SE <- function(se_gr, modules_tsv){
   r_dt <- dt[,.(se_coord = related_coord, group_id = direct_coord,
                 hop = suppressWarnings(as.integer(min_hops)))]
   hop_dt <- unique(rbind(d_dt, r_dt, fill = TRUE))
-  # map back by se_id (== se_coord in your loader)
+  # map back by se_id (== se_coord in loader)
   m <- match(S4Vectors::mcols(se_gr)$se_id, hop_dt$se_coord)
   S4Vectors::mcols(se_gr)$hop <- hop_dt$hop[m]
   S4Vectors::mcols(se_gr)$hop[is.na(S4Vectors::mcols(se_gr)$hop)] <- 0L  # fallback
