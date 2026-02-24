@@ -14,10 +14,10 @@ library(igraph)
 # -----------------------------
 # Parameters & Inputs
 # -----------------------------
-loops_file   <- "KO_loops.bedpe"
-peaks_file   <- "MYOD1_ChIP_K0.narrowPeak"
+loops_file   <- "loops.bedpe"
+peaks_file   <- "MYOD1_ChIP.narrowPeak"
 enh_file     <- "Combined_enhancers_File.tsv"
-tads_bedpe   <- "KO_TAD_10000_blocks.bedpe"
+tads_bedpe   <- "TAD_10000_blocks.bedpe"
 
 anchor_extend <- 5000L   # extend each loop anchor ±5 kb before overlaps
 
@@ -307,8 +307,8 @@ if (nrow(modules)) {
     start = as.numeric(sub(".*:(\\d+)-.*", "\\1", related_coord)),
     end   = as.numeric(sub(".*-(\\d+)$", "\\1", related_coord))
   )])
-  fwrite(direct_bed, "MYOD1_direct_enhancers_KO.bed", sep = "\t", col.names = FALSE)
-  fwrite(related_bed, "MYOD1_related_enhancers_KO.bed", sep = "\t", col.names = FALSE)
+  #fwrite(direct_bed, "MYOD1_direct_enhancers_KO.bed", sep = "\t", col.names = FALSE)
+  #fwrite(related_bed, "MYOD1_related_enhancers_KO.bed", sep = "\t", col.names = FALSE)
   
   # ---- Per-TAD summary ----
   tad_summary <- modules[, .(
@@ -322,7 +322,7 @@ if (nrow(modules)) {
 
 
 ###############################################################
-#  STEP 1:  Annotate MYOD1 modules with enhancer signal & type
+ Annotate MYOD1 modules with enhancer signal & type
 ###############################################################
 library(data.table)
 library(GenomicRanges)
@@ -330,7 +330,7 @@ library(dplyr)
 
 modules <- fread("MYOD1_related_modules_KO.tsv")
 super_file <- "LHCN_SMCHD1KO_Shared_superEnhancers_K27ac_K4me1_withGeneAnnotations20251018.csv"
-enh_file   <- "Combined_enhancersSMCHD1KO_12KB_STITCHED_TSS_DISTAL_REGION_MAP.tsv"
+enh_file   <- "Combined_enhancers_File.tsv"
 
 # ---- Load enhancer signals (stitched regions) ----
 enh <- fread(enh_file)
