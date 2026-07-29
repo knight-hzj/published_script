@@ -93,7 +93,7 @@ Zhi-jun Huang
 Van Andel Institute  
 zhijun.huang@vai.org
 
-Gerd Pfeifer 
-Van Andel Institute 
+Gerd Pfeifer  
+Van Andel Institute  
 gerd.pfeifer@vai.org
 
