@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata below."
+type: script
+title: "MYOD1-related enhancer nexus analysis"
+version: 1.0.1
+date-released: 2026-07-28
+
+authors:
+  - family-names: Huang
+    given-names: Zhi-Jun
+    affiliation: Van Andel Institute
+    orcid: "https://orcid.org/0000-0002-5534-7576"
+
+abstract: >
+  R scripts used to identify MYOD1-related loop-chained enhancer
+  modules, characterize enhancer nexus connectivity, link enhancer
+  modules to gene promoters, and calculate ABC-like regulatory scores
+  in WT and SMCHD1-KO cells.
+
+keywords:
+  - MYOD1
+  - SMCHD1
+  - chromatin loops
+  - enhancer nexus
+  - activity-by-contact
+  - gene regulation
+
+repository-code: https://github.com/knight-hzj/published_script
+license: MIT
