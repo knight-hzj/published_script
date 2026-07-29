@@ -3,11 +3,6 @@
 This repository contains the scripts used for loop-chaining analysis
 in SMCHD1 loss re-wires MYOD1 enhancer nexuses and chromatin accessibility landscapes in muscle cells.
 
-## Repository structure
-
-The analysis scripts are located in:
-
-`Pfeifer_lab/loop_chaining/`
 
 ## Requirements
 
