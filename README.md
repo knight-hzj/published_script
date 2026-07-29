@@ -80,6 +80,15 @@ Summarizes the internal organization of each module in WT and SMCHD1-KO cells.
 Calculates the number of enhancers, maximum hop distance, connectivity between adjacent hop levels, non-adjacent edges and overall edge density for each module.
 
 
+## Output
+
+The workflow generates:
+MYOD1_related_modules_[WT/KO].tsv: Directly MYOD1-bound enhancers and their loop-connected enhancers, including genomic coordinates, activity, TAD assignment, and minimum loop-hop distance.
+MYOD1_modules_per_TAD_[WT/KO].tsv: Numbers of direct and related enhancers in each TAD.
+MYOD1_modules_withSuperType_[WT/KO].tsv: Enhancer modules annotated with H3K27ac/H3K4me1 signals and stitched- or super-enhancer classification.
+[WT/KO]_MYOD1modules_promoter_links_with_ABC_plus_groupinfo.tsv: Loop-supported enhancer–promoter links with contact strength, enhancer–TSS distance, ABC scores, and module information.
+chain_WT and chain_KO: Module-level summaries of enhancer connectivity, hop structure, additional loop edges, and network density.
+
 
 ## Citation
 
