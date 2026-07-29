@@ -82,7 +82,6 @@ Calculates the number of enhancers, maximum hop distance, connectivity between a
 
 ## Output
 
-The workflow generates:
 MYOD1_related_modules_[WT/KO].tsv: Directly MYOD1-bound enhancers and their loop-connected enhancers, including genomic coordinates, activity, TAD assignment, and minimum loop-hop distance.
 MYOD1_modules_per_TAD_[WT/KO].tsv: Numbers of direct and related enhancers in each TAD.
 MYOD1_modules_withSuperType_[WT/KO].tsv: Enhancer modules annotated with H3K27ac/H3K4me1 signals and stitched- or super-enhancer classification.
